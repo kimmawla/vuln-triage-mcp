@@ -1,2 +1,4 @@
 def main() -> None:
-    print("Hello from vuln-triage-mcp!")
+    from vuln_triage_mcp.server import run
+
+    run()
