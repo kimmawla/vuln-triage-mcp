@@ -1,0 +1,26 @@
+[project]
+name = "vuln-triage-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cvss>=3.6",
+    "fastmcp>=4.1.2",
+    "httpx>=0.28.1",
+]
+
+[project.scripts]
+vuln-triage-mcp = "vuln_triage_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+    "ruff>=0.17.1",
+]
