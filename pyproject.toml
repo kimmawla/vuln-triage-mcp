@@ -12,6 +12,10 @@ dependencies = [
     "httpx>=0.28.1",
 ]
 
+[project.urls]
+Repository = "https://github.com/kimmawla/vuln-triage-mcp"
+Issues = "https://github.com/kimmawla/vuln-triage-mcp/issues"
+
 [project.scripts]
 vuln-triage-mcp = "vuln_triage_mcp.server:main"
 

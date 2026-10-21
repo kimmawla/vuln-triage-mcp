@@ -2,8 +2,7 @@
 
 <!-- mcp-name: io.github.kimmawla/vuln-triage-mcp -->
 
-> An MCP server that tells your AI agent which vulnerabilities to fix first,
-> combining OSV.dev, FIRST EPSS, and the CISA KEV catalog into one explainable priority score.
+> Tells your AI agent which vulnerabilities to fix first, using OSV.dev, FIRST EPSS, and CISA KEV.
 
 [badges: PyPI version, Python versions, license, tests]
 
