@@ -116,7 +116,9 @@ async def test_query_package_sends_body_and_normalizes(http):
 
     result = await OSVClient(http).query_package("org.apache.logging.log4j:log4j-core", "Maven", "2.14.1")
 
-    assert [v["id"] for v in result] == [GHSA_ID]
+    assert [v["id"] for v in result["vulns"]] == [GHSA_ID]
+    assert (result["found_count"], result["returned_count"], result["pages"], result["truncated"]) == (1, 1, 1, False)
+    assert "ranking_note" not in result
     assert route.calls.last.request.read() == (
         b'{"package":{"name":"org.apache.logging.log4j:log4j-core","ecosystem":"Maven"},"version":"2.14.1"}'
     )
@@ -125,7 +127,15 @@ async def test_query_package_sends_body_and_normalizes(http):
 @respx.mock
 async def test_query_package_no_vulns(http):
     respx.post(f"{BASE_URL}/query").mock(return_value=httpx.Response(200, json={}))
-    assert await OSVClient(http).query_package("safe", "PyPI", "1.0") == []
+    result = await OSVClient(http).query_package("safe", "PyPI", "1.0")
+    assert result == {
+        "vulns": [],
+        "found_count": 0,
+        "returned_count": 0,
+        "pages": 1,
+        "truncated": False,
+        "truncation_reason": None,
+    }
 
 
 def test_cve_id_itself_counts_as_cve():

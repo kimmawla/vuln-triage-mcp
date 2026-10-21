@@ -42,3 +42,52 @@ def validate_ecosystem(ecosystem: object) -> str:
         if match is not None:
             return match
     raise ToolError(f"Unsupported ecosystem. Expected one of: {', '.join(OSV_ECOSYSTEMS)}.")
+
+
+# Package names across the supported ecosystems: PyPI, npm (@scope/name), Go module paths,
+# Maven group:artifact, crates.io, RubyGems, NuGet, Packagist vendor/package.
+_PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9@][A-Za-z0-9@/._:+~-]*")
+_MAX_PACKAGE_NAME_LEN = 256
+# Versions: semver with pre-release/build (1.0.0-rc.1+b2), Go (v1.2.3), PEP 440 (2!1.0.post1).
+_VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~:!-]*")
+_MAX_VERSION_LEN = 128
+
+
+def validate_cve_id(cve_id: object) -> str:
+    """Return the canonical form of a CVE ID, or raise ToolError (with a hint for GHSA IDs)."""
+    if isinstance(cve_id, str) and len(cve_id) <= _MAX_ID_LEN:
+        candidate = cve_id.strip().upper()
+        if candidate.isascii() and _CVE_RE.fullmatch(candidate):
+            return candidate
+        if candidate.startswith("GHSA-"):
+            raise ToolError(
+                "This tool needs a CVE ID, not a GHSA ID. Use lookup_vulnerability to find the "
+                "advisory's CVE aliases, or triage_vulnerability, which resolves them itself."
+            )
+    raise ToolError("Invalid CVE ID. Expected CVE-YYYY-NNNN (4-7 digits).")
+
+
+def validate_package_name(name: object) -> str:
+    """Return a stripped package name, or raise ToolError."""
+    if isinstance(name, str) and len(name) <= _MAX_PACKAGE_NAME_LEN:
+        candidate = name.strip()
+        if candidate.isascii() and _PACKAGE_NAME_RE.fullmatch(candidate):
+            return candidate
+    raise ToolError(
+        f"Invalid package name. Expected an ASCII package name up to {_MAX_PACKAGE_NAME_LEN} "
+        "characters, e.g. requests, @types/node, org.apache.logging.log4j:log4j-core."
+    )
+
+
+def validate_version(version: object) -> str | None:
+    """Return a stripped version string, None if empty (meaning "all versions"), or raise ToolError."""
+    if isinstance(version, str) and len(version) <= _MAX_VERSION_LEN:
+        candidate = version.strip()
+        if not candidate:
+            return None
+        if candidate.isascii() and _VERSION_RE.fullmatch(candidate):
+            return candidate
+    raise ToolError(
+        f"Invalid version. Expected a version string up to {_MAX_VERSION_LEN} characters, "
+        "e.g. 2.14.1, v1.2.3, 1.0.0-rc.1, or an empty string for all versions."
+    )

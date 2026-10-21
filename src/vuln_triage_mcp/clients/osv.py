@@ -1,11 +1,13 @@
 """OSV.dev client. Returns advisories normalized to a compact, model-friendly dict."""
 
+import asyncio
 import logging
 import re
 from enum import StrEnum
 from typing import Any
 
 import httpx
+from fastmcp.exceptions import ToolError
 
 from vuln_triage_mcp.clients._http import NotFoundError, request_json
 from vuln_triage_mcp.clients.cvss_base import base_score, vector_version
@@ -25,6 +27,15 @@ FIELD_MAX_LEN = 200
 URL_MAX_LEN = 500
 
 _CVE_RE = re.compile(r"CVE-[0-9]{4}-[0-9]{4,7}")
+
+# POST /v1/query pagination (see docs/api-notes.md). Huge packages (Debian linux) run to
+# ~15k advisories over 7 pages at ~10s each, so stop at whichever limit comes first.
+MAX_QUERY_PAGES = 5
+QUERY_BUDGET_SECONDS = 25.0
+# Advisories returned per query, after dedupe and sorting.
+MAX_QUERY_RESULTS = 50
+PAGINATION_STALLED = "pagination did not advance"
+RANKING_NOTE = "Ranking covers only the advisories collected before truncation."
 
 
 class CVSSSource(StrEnum):
@@ -65,12 +76,107 @@ class OSVClient:
             raise NotFoundError(f"No OSV.dev advisory found for {vuln_id}.") from None
         return normalize_vuln(data)
 
-    async def query_package(self, name: str, ecosystem: str, version: str) -> list[dict[str, Any]]:
-        """List advisories affecting one package version. Expects validated inputs."""
-        body = {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
-        data = await request_json(self._http, "POST", f"{BASE_URL}/query", service=SERVICE, json=body)
-        vulns = data.get("vulns") if isinstance(data, dict) else None
-        return [normalize_vuln(v) for v in vulns or [] if isinstance(v, dict)]
+    async def query_package(
+        self, name: str, ecosystem: str, version: str | None, *, limit: int = MAX_QUERY_RESULTS
+    ) -> dict[str, Any]:
+        """List advisories affecting a package, or one version of it. Expects validated inputs.
+
+        Follows next_page_token for up to MAX_QUERY_PAGES pages within QUERY_BUDGET_SECONDS,
+        dedupes by advisory ID, sorts by CVSS (highest first, unscored last, then ID), and
+        returns at most `limit`. Returns {"vulns", "found_count", "returned_count", "pages",
+        "truncated", "truncation_reason"}, plus "ranking_note" only when truncated.
+        found_count counts unique advisories collected, before the cap; returned_count is
+        len(vulns).
+        A first-page failure raises ToolError; a later-page failure returns what was
+        collected with truncated=true.
+        """
+        query: dict[str, Any] = {"package": {"name": name, "ecosystem": ecosystem}}
+        if version is not None:
+            query["version"] = version
+
+        deadline = asyncio.get_running_loop().time() + QUERY_BUDGET_SECONDS
+        by_id: dict[str, dict[str, Any]] = {}
+        unnamed: list[dict[str, Any]] = []
+        used_tokens: set[str] = set()
+        first_ids: set[str] = set()
+        token: str | None = None
+        pages = 0
+        stop_reason: str | None = None
+
+        while True:
+            body = query if token is None else {**query, "page_token": token}
+            try:
+                async with asyncio.timeout_at(deadline):
+                    data = await request_json(self._http, "POST", f"{BASE_URL}/query", service=SERVICE, json=body)
+            except (TimeoutError, ToolError) as exc:
+                if pages == 0:
+                    if isinstance(exc, TimeoutError):
+                        raise ToolError(f"{SERVICE} query exceeded {QUERY_BUDGET_SECONDS:g}s. Try again later.") from None
+                    raise
+                stop_reason = (
+                    f"time budget of {QUERY_BUDGET_SECONDS:g}s exhausted"
+                    if isinstance(exc, TimeoutError)
+                    else f"page {pages + 1} failed: {exc}"
+                )
+                break
+
+            raw = data.get("vulns") if isinstance(data, dict) else None
+            page = [normalize_vuln(v) for v in raw or [] if isinstance(v, dict)]
+            if page and page[0]["id"] and page[0]["id"] in first_ids:
+                stop_reason = PAGINATION_STALLED
+                logger.warning(
+                    "%s query for %s/%s: page %d repeats a previous page's first advisory %s; stopping",
+                    SERVICE, ecosystem, name, pages + 1, page[0]["id"],
+                )
+                break
+            pages += 1
+            if page and page[0]["id"]:
+                first_ids.add(page[0]["id"])
+            for vuln in page:
+                if vuln["id"]:
+                    by_id.setdefault(vuln["id"], vuln)
+                else:
+                    unnamed.append(vuln)
+
+            if token is not None:
+                used_tokens.add(token)
+            next_token = data.get("next_page_token") if isinstance(data, dict) else None
+            if not isinstance(next_token, str) or not next_token:
+                break
+            if next_token in used_tokens:
+                stop_reason = PAGINATION_STALLED
+                logger.warning(
+                    "%s query for %s/%s: page %d returned an already-used page token; stopping",
+                    SERVICE, ecosystem, name, pages,
+                )
+                break
+            if pages >= MAX_QUERY_PAGES:
+                stop_reason = f"page limit of {MAX_QUERY_PAGES} reached"
+                break
+            token = next_token
+
+        vulns = sorted([*by_id.values(), *unnamed], key=_cvss_sort_key)
+        reasons = [stop_reason] if stop_reason else []
+        if len(vulns) > limit:
+            reasons.append(f"showing the {limit} highest-CVSS of {len(vulns)} advisories")
+        returned = vulns[:limit]
+        result: dict[str, Any] = {
+            "vulns": returned,
+            "found_count": len(vulns),
+            "returned_count": len(returned),
+            "pages": pages,
+            "truncated": bool(reasons),
+            "truncation_reason": "; ".join(reasons) or None,
+        }
+        if reasons:
+            result["ranking_note"] = RANKING_NOTE
+        return result
+
+
+def _cvss_sort_key(vuln: dict[str, Any]) -> tuple[bool, float, str]:
+    """Highest CVSS first; advisories without a score last; ties by ID for a stable order."""
+    score = vuln["cvss_score"]
+    return (score is None, -(score or 0.0), vuln["id"])
 
 
 def normalize_vuln(data: dict[str, Any]) -> dict[str, Any]:
