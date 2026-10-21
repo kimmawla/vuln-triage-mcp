@@ -4,7 +4,10 @@
 
 > Tells your AI agent which vulnerabilities to fix first, using OSV.dev, FIRST EPSS, and CISA KEV.
 
-[badges: PyPI version, Python versions, license, tests]
+[![PyPI version](https://img.shields.io/pypi/v/vuln-triage-mcp)](https://pypi.org/project/vuln-triage-mcp/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://pypi.org/project/vuln-triage-mcp/)
+[![License: MIT](https://img.shields.io/github/license/kimmawla/vuln-triage-mcp)](LICENSE)
+[![Tests](https://github.com/kimmawla/vuln-triage-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/kimmawla/vuln-triage-mcp/actions/workflows/ci.yml)
 
 ## Why this exists
 Two or three sentences. CVSS alone ranks by severity, not by likelihood of exploitation.
