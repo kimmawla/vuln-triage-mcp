@@ -19,8 +19,10 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "jsonschema>=4.26.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pyyaml>=6.0.3",
     "respx>=0.23.1",
     "ruff>=0.17.1",
 ]
@@ -28,3 +30,8 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Live-network tests are opt-in: `uv run pytest -m live`. CI runs offline.
+addopts = "-m 'not live'"
+markers = [
+    "live: calls the real OSV, EPSS, and KEV APIs; skipped by default (run with -m live)",
+]
