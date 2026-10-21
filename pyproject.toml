@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-vuln-triage-mcp = "vuln_triage_mcp:main"
+vuln-triage-mcp = "vuln_triage_mcp.server:main"
 
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]
