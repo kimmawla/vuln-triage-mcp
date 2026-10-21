@@ -56,6 +56,7 @@ async def test_get_vuln_success(http):
         "cvss_score": 10.0,
         "cvss_version": "3.1",
         "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+        "cvss_metric_group": "base",
         "cvss_source": "vector",
         "severity_label": "CRITICAL",
         "fixed_versions": [

@@ -6,9 +6,9 @@ from enum import StrEnum
 from typing import Any
 
 import httpx
-from cvss import CVSS2, CVSS3, CVSS4
 
 from vuln_triage_mcp.clients._http import NotFoundError, request_json
+from vuln_triage_mcp.clients.cvss_base import base_score, vector_version
 from vuln_triage_mcp.sanitize import clean_untrusted
 
 logger = logging.getLogger(__name__)
@@ -32,9 +32,16 @@ class CVSSSource(StrEnum):
     GHSA_LABEL = "ghsa_label"
 
 
-# Selection order: v3.x, then v4.0, then v2. The first parseable vector wins.
-_CVSS_PARSERS = (("CVSS_V3", CVSS3), ("CVSS_V4", CVSS4), ("CVSS_V2", CVSS2))
-_FIXED_CVSS_VERSIONS = {"CVSS_V4": "4.0", "CVSS_V2": "2.0"}
+# Selection order: v3.x, then v4.0, then v2. The first vector with a usable score wins.
+# Each OSV severity type accepts only vectors whose prefix names one of its versions.
+_CVSS_TYPES = (
+    ("CVSS_V3", frozenset({"3.0", "3.1"})),
+    ("CVSS_V4", frozenset({"4.0"})),
+    ("CVSS_V2", frozenset({"2.0"})),
+)
+
+# Scores always use base metrics only; exploit likelihood comes from EPSS and KEV instead.
+CVSS_METRIC_GROUP = "base"
 
 # database_specific.severity values (GHSA uses MODERATE): (approximate score, qualitative label).
 _GHSA_LABELS = {
@@ -99,9 +106,10 @@ def _cve_ids(vuln_id: str, aliases: object) -> list[str]:
 
 
 def _cvss(vuln_id: str, severity: object, database_specific: object) -> dict[str, Any]:
-    """Return cvss_score, cvss_version, cvss_vector, cvss_source, and severity_label.
+    """Return cvss_score, cvss_version, cvss_vector, cvss_metric_group, cvss_source, and severity_label.
 
     Tries vectors in _CVSS_PARSERS order, then the GHSA label. Never defaults to a score of 0.
+    A vector score is always the base score; cvss_vector keeps the full vector as published.
     """
     parsed = _parse_vector(vuln_id, severity)
     if parsed is not None:
@@ -110,6 +118,7 @@ def _cvss(vuln_id: str, severity: object, database_specific: object) -> dict[str
             "cvss_score": score,
             "cvss_version": version,
             "cvss_vector": vector,
+            "cvss_metric_group": CVSS_METRIC_GROUP,
             "cvss_source": CVSSSource.VECTOR,
             "severity_label": _label_from_score(score, version),
         }
@@ -122,6 +131,7 @@ def _cvss(vuln_id: str, severity: object, database_specific: object) -> dict[str
             "cvss_score": score,
             "cvss_version": None,
             "cvss_vector": None,
+            "cvss_metric_group": None,
             "cvss_source": CVSSSource.GHSA_LABEL,
             "severity_label": label,
         }
@@ -130,6 +140,7 @@ def _cvss(vuln_id: str, severity: object, database_specific: object) -> dict[str
         "cvss_score": None,
         "cvss_version": None,
         "cvss_vector": None,
+        "cvss_metric_group": None,
         "cvss_source": None,
         "severity_label": None,
     }
@@ -137,24 +148,21 @@ def _cvss(vuln_id: str, severity: object, database_specific: object) -> dict[str
 
 def _parse_vector(vuln_id: str, severity: object) -> tuple[float, str, str] | None:
     entries = [e for e in severity if isinstance(e, dict)] if isinstance(severity, list) else []
-    for sev_type, parser in _CVSS_PARSERS:
+    for sev_type, versions in _CVSS_TYPES:
         for entry in entries:
             if entry.get("type") != sev_type:
                 continue
             vector = entry.get("score")
-            try:
-                cvss = parser(vector)
-                score = float(cvss.base_score)
-            # Third-party parser on untrusted input: any failure means "try the next vector".
-            except Exception:  # noqa: BLE001 - e.g. CVSSError, or AttributeError on non-str
+            version = vector_version(vector)
+            score = base_score(vector) if version in versions else None
+            if score is None:
                 logger.warning(
-                    "%s: unparseable %s vector %r; falling back",
+                    "%s: unusable %s vector %r; falling back",
                     vuln_id,
                     sev_type,
                     vector[:200] if isinstance(vector, str) else type(vector).__name__,
                 )
                 continue
-            version = f"3.{cvss.minor_version}" if sev_type == "CVSS_V3" else _FIXED_CVSS_VERSIONS[sev_type]
             return score, version, vector
     return None
 

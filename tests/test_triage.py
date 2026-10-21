@@ -68,8 +68,11 @@ async def test_cve_sources_run_concurrently(deps):
     assert result["epss"] == {"cve_id": CVE, "epss": 0.94424, "percentile": 0.99985}
     assert result["kev"]["status"] is KEVStatus.LISTED
     assert result["kev"]["entries"][0]["cve_id"] == CVE
-    assert set(result["priority"]["components"]) == {"cvss", "epss", "kev_floor"}
-    assert result["priority"]["score"] == 100
+    assert result["priority"]["components"] == {"cvss": 40.0, "epss": 33.0, "kev": 25.0}
+    assert result["priority"]["score"] == 98
+    assert result["priority"]["bucket"] == "critical"
+    assert result["priority"]["confidence"] == "full"
+    assert result["fix_available"] is True
 
 
 @respx.mock
@@ -98,7 +101,8 @@ async def test_kev_failure_returns_partial_with_unknown_status(deps):
     assert [m["source"] for m in result["missing_sources"]] == ["CISA KEV"]
     assert "KEV catalog unavailable" in result["missing_sources"][0]["reason"]
     assert result["kev"] == {"status": KEVStatus.UNKNOWN, "stale": None, "catalog_fetched_at": None, "entries": []}
-    assert "kev_floor" not in result["priority"]["components"]
+    assert "kev" not in result["priority"]["components"]
+    assert result["priority"]["confidence"] == "partial"
     assert "KEV status could not be determined" in result["priority"]["reasoning"]
     assert result["epss"] is not None
 
@@ -110,7 +114,8 @@ async def test_both_enrichment_sources_fail(deps):
     result = await triage(CVE, **deps)
 
     assert [m["source"] for m in result["missing_sources"]] == ["FIRST EPSS", "CISA KEV"]
-    assert result["priority"]["components"] == {"cvss": 50.0}
+    assert result["priority"]["components"] == {"cvss": 40.0}
+    assert result["priority"]["confidence"] == "low"
     assert result["advisory"]["id"] == CVE
 
 

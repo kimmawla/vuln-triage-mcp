@@ -10,7 +10,8 @@ EPSS and KEV are enrichment, and their failure yields a partial result naming th
 import asyncio
 import logging
 from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from enum import StrEnum
 from typing import Any
 
 from fastmcp.exceptions import ToolError
@@ -28,12 +29,40 @@ logger = logging.getLogger(__name__)
 # (to learn its CVE IDs) and then EPSS/KEV, so this covers two sequential phases.
 TRIAGE_TIMEOUT_SECONDS = 25.0
 
-# Known-exploited vulnerabilities never score below this.
+# Weights per docs/scoring-spec.md. Maximum total is 40 + 35 + 25 = 100.
+CVSS_WEIGHT = 40.0
+EPSS_WEIGHT = 35.0
+KEV_BONUS = 25.0
+# Known-exploited vulnerabilities never score below this, even on stale KEV data.
 KEV_FLOOR = 80
-# Placeholder weights: CVSS and EPSS percentile each contribute up to 50 points.
-CVSS_WEIGHT = 50.0
-EPSS_WEIGHT = 50.0
 CVSS_VERSIONS = frozenset({"2.0", "3.0", "3.1", "4.0"})
+
+
+class Bucket(StrEnum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class Confidence(StrEnum):
+    FULL = "full"
+    PARTIAL = "partial"
+    LOW = "low"
+
+
+# Lower bound of each bucket, highest first.
+_BUCKETS = ((80, Bucket.CRITICAL), (60, Bucket.HIGH), (40, Bucket.MEDIUM), (0, Bucket.LOW))
+
+
+@dataclass(frozen=True)
+class PriorityScore:
+    score: int
+    bucket: Bucket
+    # Points per available signal; a missing signal has no key rather than 0.
+    components: dict[str, float]
+    confidence: Confidence
+    reasoning: str
 
 
 @dataclass(frozen=True)
@@ -86,26 +115,32 @@ def _cvss_reason(score: float, version: str | None, source: CVSSSource, points: 
     return f"CVSS {version} base score {score:.1f} contributes {points:g} points."
 
 
+def _bucket(score: int) -> Bucket:
+    return next(bucket for floor, bucket in _BUCKETS if score >= floor)
+
+
 def score_vulnerability(
     *,
     cvss_score: float | None,
     cvss_version: str | None,
     cvss_source: str | None,
-    epss_percentile: float | None,
+    epss: float | None,
     kev: KEVInput,
-) -> dict[str, Any]:
-    """Return {"score": int 0-100, "components": {name: points}, "reasoning": str}.
+) -> PriorityScore:
+    """Composite 0-100 priority per docs/scoring-spec.md.
 
-    cvss_version and cvss_source come from the OSV client's normalized result.
-    Missing inputs are omitted from components and called out in reasoning.
+    cvss_version and cvss_source come from the OSV client's normalized result; epss is the
+    EPSS probability (not the percentile). Missing inputs are omitted from components,
+    named in reasoning, and lower confidence; they never count as 0.
     """
     if cvss_score is not None and not 0.0 <= cvss_score <= 10.0:
         raise ValueError("cvss_score must be between 0 and 10")
-    if epss_percentile is not None and not 0.0 <= epss_percentile <= 1.0:
-        raise ValueError("epss_percentile must be between 0 and 1")
+    if epss is not None and not 0.0 <= epss <= 1.0:
+        raise ValueError("epss must be between 0 and 1")
 
     components: dict[str, float] = {}
     reasons: list[str] = []
+    missing: list[str] = []
 
     if cvss_score is not None:
         source = CVSSSource(cvss_source)
@@ -114,34 +149,35 @@ def score_vulnerability(
         components["cvss"] = round(cvss_score / 10.0 * CVSS_WEIGHT, 1)
         reasons.append(_cvss_reason(cvss_score, cvss_version, source, components["cvss"]))
     else:
+        missing.append("CVSS")
         reasons.append("No CVSS score available; CVSS component omitted.")
 
-    if epss_percentile is not None:
-        components["epss"] = round(epss_percentile * EPSS_WEIGHT, 1)
-        reasons.append(
-            f"EPSS percentile {epss_percentile:.2f} contributes {components['epss']:g} points."
-        )
+    if epss is not None:
+        components["epss"] = round(epss * EPSS_WEIGHT, 1)
+        reasons.append(f"EPSS probability {epss:.3f} contributes {components['epss']:g} points.")
     else:
+        missing.append("EPSS")
         reasons.append("No EPSS score available; EPSS component omitted.")
 
-    score = sum(components.values())
-
     if kev.status is KEVStatus.LISTED:
-        components["kev_floor"] = KEV_FLOOR
-        if score < KEV_FLOOR:
-            reasons.append(f"Listed in CISA KEV (known exploited); score raised to the {KEV_FLOOR} floor.")
-        else:
-            reasons.append("Listed in CISA KEV (known exploited).")
-        score = max(score, KEV_FLOOR)
+        components["kev"] = KEV_BONUS
+        reasons.append(f"Listed in CISA KEV (known exploited) adds {KEV_BONUS:g} points.")
     elif kev.status is KEVStatus.NOT_LISTED:
-        components["kev_floor"] = 0
+        components["kev"] = 0.0
         reasons.append("Not listed in CISA KEV.")
     else:
+        missing.append("KEV")
         reasons.append(
             "KEV status could not be determined (catalog unavailable), so the KEV component "
             "is omitted. If this CVE is known exploited, the true priority is at least "
             f"{KEV_FLOOR}."
         )
+
+    # Half-up rounding. Re-rounding the sum to 0.1 first strips float noise (59.4999... -> 59.5).
+    score = min(int(round(sum(components.values()), 1) + 0.5), 100)
+    if kev.status is KEVStatus.LISTED and score < KEV_FLOOR:
+        reasons.append(f"Score raised from {score} to the KEV floor of {KEV_FLOOR}.")
+        score = KEV_FLOOR
 
     if kev.stale and kev.status is not KEVStatus.UNKNOWN:
         reasons.append(
@@ -149,11 +185,31 @@ def score_vulnerability(
             "refresh failed), so the listing may be out of date."
         )
 
-    return {
-        "score": round(min(score, 100.0)),
-        "components": components,
-        "reasoning": " ".join(reasons),
-    }
+    signals = 3 - len(missing)
+    confidence = Confidence.FULL if signals == 3 else Confidence.PARTIAL if signals == 2 else Confidence.LOW
+    if missing:
+        reasons.append(f"Confidence {confidence}: {signals} of 3 signals; missing {', '.join(missing)}.")
+    else:
+        reasons.append(f"Confidence {confidence}: all 3 signals available.")
+
+    return PriorityScore(
+        score=score,
+        bucket=_bucket(score),
+        components=components,
+        confidence=confidence,
+        reasoning=" ".join(reasons),
+    )
+
+
+def fix_available(advisory: Mapping[str, Any]) -> bool | None:
+    """True if any affected package has a fixed version, False if none do, None if OSV lists no packages.
+
+    Reported alongside the score; never an input to it.
+    """
+    packages = advisory.get("fixed_versions") or []
+    if not packages:
+        return None
+    return any(package["fixed"] for package in packages)
 
 
 async def _within(deadline: float, awaitable: Awaitable[Any]) -> Any:
@@ -171,11 +227,11 @@ def _failure_reason(service: str, exc: BaseException) -> str:
 
 
 async def _epss_best(client: EPSSClient, cve_ids: list[str]) -> dict[str, Any] | None:
-    """Highest-percentile EPSS score across the CVE IDs, or None if EPSS has no score."""
+    """Highest EPSS probability across the CVE IDs, or None if EPSS has no score."""
     scores = await client.get_scores(cve_ids)
     if not scores:
         return None
-    cve_id, best = max(scores.items(), key=lambda item: item[1]["percentile"])
+    cve_id, best = max(scores.items(), key=lambda item: item[1]["epss"])
     return {"cve_id": cve_id, **best}
 
 
@@ -240,12 +296,13 @@ async def triage(
         cvss_score=advisory["cvss_score"],
         cvss_version=advisory["cvss_version"],
         cvss_source=advisory["cvss_source"],
-        epss_percentile=epss_result["percentile"] if epss_result else None,
+        epss=epss_result["epss"] if epss_result else None,
         kev=kev_input,
     )
     return {
         "vuln_id": vuln_id,
-        "priority": priority,
+        "priority": asdict(priority),
+        "fix_available": fix_available(advisory),
         "advisory": advisory,
         "epss": epss_result,
         "kev": {

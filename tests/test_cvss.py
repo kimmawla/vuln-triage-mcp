@@ -8,10 +8,14 @@ with its severity replaced by NVD's published CVSS v2 vector for CVE-2021-44228.
 import copy
 import json
 import logging
+import sys
 from pathlib import Path
 
+import cvss.constants4
 import pytest
 
+from vuln_triage_mcp.clients import cvss_base
+from vuln_triage_mcp.clients.cvss_base import base_score
 from vuln_triage_mcp.clients.kev import KEVStatus
 from vuln_triage_mcp.clients.osv import CVSSSource, normalize_vuln
 from vuln_triage_mcp.scoring import KEVInput, score_vulnerability
@@ -36,7 +40,7 @@ def score(advisory: dict) -> dict:
         cvss_score=result["cvss_score"],
         cvss_version=result["cvss_version"],
         cvss_source=result["cvss_source"],
-        epss_percentile=0.5,
+        epss=0.5,
         kev=NOT_LISTED,
     )
 
@@ -55,11 +59,11 @@ def score(advisory: dict) -> dict:
         (
             "v4_0_only",
             (
-                2.7,
+                6.9,  # base score; the published vector's E:U would make it 2.7
                 "4.0",
                 "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N/E:U",
                 "vector",
-                "LOW",
+                "MEDIUM",
             ),
         ),
         (
@@ -85,15 +89,15 @@ def test_v3_1_preferred_even_when_v4_listed_first():
 def test_v2_only_scoring_flags_older_scale():
     result = score(load("v2_only"))
 
-    assert result["components"]["cvss"] == 46.5
-    assert "CVSS 2.0" in result["reasoning"]
-    assert "older CVSS v2 scale" in result["reasoning"]
-    assert "approximate" in result["reasoning"]
+    assert result.components["cvss"] == 37.2  # 9.3 / 10 * 40
+    assert "CVSS 2.0" in result.reasoning
+    assert "older CVSS v2 scale" in result.reasoning
+    assert "approximate" in result.reasoning
 
 
 @pytest.mark.parametrize("fixture", ["v3_1_only", "v3_1_and_v4_0", "v4_0_only", "v3_0_only"])
 def test_modern_vector_scoring_not_flagged(fixture):
-    reasoning = score(load(fixture))["reasoning"]
+    reasoning = score(load(fixture)).reasoning
     assert "approximate" not in reasoning
     assert "older" not in reasoning
 
@@ -112,7 +116,7 @@ def test_malformed_v3_falls_back_to_v4(caplog):
         "vector",
         "HIGH",
     )
-    assert any("unparseable CVSS_V3 vector" in r.message for r in caplog.records)
+    assert any("unusable CVSS_V3 vector" in r.message for r in caplog.records)
 
 
 def test_all_vectors_malformed_falls_back_to_ghsa_label(caplog):
@@ -164,15 +168,15 @@ def test_ghsa_label_approximations(label, expected):
 def test_ghsa_label_scoring_says_approximate():
     result = score(load("ghsa_label_only"))
 
-    assert result["components"]["cvss"] == 25.0
-    assert "approximated from the GHSA severity label" in result["reasoning"]
+    assert result.components["cvss"] == 20.0  # 5.0 / 10 * 40
+    assert "approximated from the GHSA severity label" in result.reasoning
 
 
 def test_no_severity_scoring_omits_cvss_component():
     result = score(load("no_severity"))
 
-    assert "cvss" not in result["components"]
-    assert "No CVSS score available; CVSS component omitted." in result["reasoning"]
+    assert "cvss" not in result.components
+    assert "No CVSS score available; CVSS component omitted." in result.reasoning
 
 
 def test_zero_vector_score_stays_zero_not_null():
@@ -185,14 +189,98 @@ def test_zero_vector_score_stays_zero_not_null():
 def test_scoring_rejects_inconsistent_cvss_metadata():
     with pytest.raises(ValueError):
         score_vulnerability(
-            cvss_score=5.0, cvss_version=None, cvss_source="vector", epss_percentile=None, kev=NOT_LISTED
+            cvss_score=5.0, cvss_version=None, cvss_source="vector", epss=None, kev=NOT_LISTED
         )
     with pytest.raises(ValueError):
         score_vulnerability(
-            cvss_score=5.0, cvss_version="3.1", cvss_source="guess", epss_percentile=None, kev=NOT_LISTED
+            cvss_score=5.0, cvss_version="3.1", cvss_source="guess", epss=None, kev=NOT_LISTED
         )
 
 
 def test_normalized_result_is_json_serializable():
     for path in FIXTURES.glob("*.json"):
         json.dumps(normalize_vuln(json.loads(path.read_text())))
+
+
+# --- Base-score edge cases and cvss API fallback ---
+# Upgrade-sensitive base-score checks live in tests/test_cvss_upgrade_guard.py.
+
+V4_E_U = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N/E:U"
+THREAT_ADJUSTED_V4_E_U = 2.7
+
+
+def with_vector(sev_type: str, vector: str, **extra) -> dict:
+    return normalize_vuln({"id": "X", "severity": [{"type": sev_type, "score": vector}], **extra})
+
+
+def test_malformed_threat_metric_still_rejects_vector():
+    result = with_vector("CVSS_V4", V4_E_U.replace("E:U", "E:BOGUS"))
+    assert result["cvss_score"] is None
+
+
+def test_vector_prefix_must_match_severity_type():
+    # A v4.0 vector filed under CVSS_V3 is not scored as v3 (or silently as v4).
+    result = with_vector("CVSS_V3", V4_E_U)
+    assert result["cvss_score"] is None
+
+
+@pytest.mark.parametrize("fixture", ["ghsa_label_only", "no_severity"])
+def test_metric_group_null_without_vector(fixture):
+    assert normalize_vuln(load(fixture))["cvss_metric_group"] is None
+
+
+@pytest.fixture
+def v4_api_broken(request, monkeypatch):
+    """Simulate a cvss upgrade that breaks the non-public attributes base_score uses."""
+    if request.param == "import":
+        monkeypatch.setitem(sys.modules, "cvss.constants4", None)  # import raises ImportError
+    elif request.param == "attribute":
+
+        class CVSS4WithoutMetrics(cvss_base.CVSS4):
+            def __init__(self, vector):
+                super().__init__(vector)
+                del self.metrics
+
+        monkeypatch.setattr(cvss_base, "CVSS4", CVSS4WithoutMetrics)
+    elif request.param == "meaning":
+        # METRICS_MANDATORY still exists but now includes a threat metric.
+        monkeypatch.setattr(cvss.constants4, "METRICS_MANDATORY", [*cvss.constants4.METRICS_MANDATORY, "E"])
+    return request.param
+
+
+BROKEN_APIS = ["import", "attribute", "meaning"]
+
+
+@pytest.mark.parametrize("v4_api_broken", BROKEN_APIS, indirect=True)
+def test_cvss_api_break_returns_none_with_warning(v4_api_broken, caplog):
+    with caplog.at_level(logging.WARNING, logger="vuln_triage_mcp.clients.cvss_base"):
+        assert base_score(V4_E_U) is None
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.parametrize("v4_api_broken", BROKEN_APIS, indirect=True)
+def test_cvss_api_break_falls_back_to_v2_never_threat_adjusted(v4_api_broken):
+    advisory = {
+        "id": "X",
+        "severity": [
+            {"type": "CVSS_V4", "score": V4_E_U},
+            {"type": "CVSS_V2", "score": "AV:N/AC:M/Au:N/C:P/I:N/A:N"},
+        ],
+    }
+    result = normalize_vuln(advisory)
+
+    assert (result["cvss_score"], result["cvss_version"]) == (4.3, "2.0")
+    assert result["cvss_score"] != THREAT_ADJUSTED_V4_E_U
+
+
+@pytest.mark.parametrize("v4_api_broken", BROKEN_APIS, indirect=True)
+def test_cvss_api_break_falls_back_to_ghsa_label(v4_api_broken):
+    result = normalize_vuln(load("v4_0_only"))  # v4.0 vector with E:U, GHSA label LOW
+
+    assert (result["cvss_score"], result["cvss_source"], result["cvss_version"]) == (2.0, "ghsa_label", None)
+    assert result["cvss_metric_group"] is None
+
+
+@pytest.mark.parametrize("v4_api_broken", BROKEN_APIS, indirect=True)
+def test_cvss_api_break_does_not_affect_v3(v4_api_broken):
+    assert base_score("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H") == 6.5
