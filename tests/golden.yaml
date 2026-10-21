@@ -1,0 +1,42 @@
+# expected buckets; revisit only when scoring spec changes
+- id: CVE-2021-44228   # Log4Shell
+  expect_bucket: critical
+- id: CVE-2023-4863    # libwebp
+  expect_bucket: critical
+- id: CVE-2014-0160    # Heartbleed
+  expect_bucket: critical
+- id: CVE-2019-10744   # lodash defaultsDeep
+  expect_bucket: [low, medium]
+- id: CVE-2022-25881   # http-cache-semantics ReDoS (CVSS 5.3, low EPSS, not in KEV)
+  expect_bucket: low
+  # --- KEV-listed: must be critical (floor at 80) ---
+- id: CVE-2017-0144    # EternalBlue (SMBv1)
+  expect_bucket: critical
+- id: CVE-2014-6271    # Shellshock (bash)
+  expect_bucket: critical
+- id: CVE-2021-34527   # PrintNightmare
+  expect_bucket: critical
+- id: CVE-2021-26855   # ProxyLogon (Exchange)
+  expect_bucket: critical
+- id: CVE-2022-22965   # Spring4Shell
+  expect_bucket: critical
+- id: CVE-2023-34362   # MOVEit Transfer
+  expect_bucket: critical
+- id: CVE-2023-44487   # HTTP/2 Rapid Reset
+  expect_bucket: critical
+
+# --- Not in KEV, low EPSS: should land low despite high CVSS ---
+- id: CVE-2021-23337   # lodash command injection (CVSS 7.2)
+  expect_bucket: low
+- id: CVE-2022-25883   # semver ReDoS (CVSS 7.5)
+  expect_bucket: low
+- id: CVE-2020-28500   # lodash ReDoS (CVSS 5.3)
+  expect_bucket: low
+
+# --- Boundary case: CVSS 9.8, not in KEV, very low EPSS ---
+- id: CVE-2023-37920   # certifi e-Tugra root removal
+  expect_bucket: [low, medium]
+
+- id: GHSA-jgpv-4h4c-xhw3   # pillow resource consumption; no aliases at all (checked 2026-10-21)
+  expect_confidence: low    # EPSS and KEV unavailable, and reasoning says so
+  expect_bucket: unknown    # low confidence + not KEV-listed: too little data, not low risk

@@ -316,3 +316,150 @@ async def test_resolve_kev_success(http):
     assert listed.status is KEVStatus.LISTED and listed.stale is False
     assert listed.catalog_fetched_at is not None
     assert not_listed.status is KEVStatus.NOT_LISTED
+
+
+# --- No OSV record / no severity component ---
+
+NO_SEVERITY = "The score has no severity component, so the bucket reflects exploitation signals (EPSS, KEV) only."
+
+
+@pytest.mark.parametrize("osv_record", [True, False], ids=["osv-record-without-cvss", "no-osv-record"])
+def test_missing_cvss_says_no_severity_component(osv_record):
+    result = score_vulnerability(
+        cvss_score=None, cvss_version=None, cvss_source=None, epss=0.3, kev=NOT_LISTED, osv_record=osv_record
+    )
+
+    assert "No CVSS score available; CVSS component omitted." in result.reasoning
+    assert NO_SEVERITY in result.reasoning
+    assert ("No OSV.dev record" in result.reasoning) is (not osv_record)
+    assert "cvss" not in result.components
+
+
+def test_no_osv_record_kev_listed_floors_at_80_and_says_why():
+    result = score_vulnerability(
+        cvss_score=None, cvss_version=None, cvss_source=None, epss=0.05, kev=LISTED_STALE, osv_record=False
+    )
+
+    assert (result.score, result.bucket) == (80, Bucket.CRITICAL)
+    assert "Score raised from 27 to the KEV floor of 80. CISA KEV lists it as exploited in the wild" in result.reasoning
+    assert NO_SEVERITY in result.reasoning
+    assert "KEV data is stale" in result.reasoning  # stale still floors, with the note
+
+
+def test_id_may_not_exist_reasoning_and_low_confidence():
+    result = score_vulnerability(
+        cvss_score=None, cvss_version=None, cvss_source=None, epss=None, kev=NOT_LISTED,
+        osv_record=False, id_may_not_exist=True,
+    )
+
+    assert result.confidence is Confidence.LOW
+    assert "This ID may not exist or may be too new" in result.reasoning
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cvss_score": 5.0, "cvss_version": "3.1", "cvss_source": "vector", "epss": None, "kev": NOT_LISTED, "osv_record": False},
+        {"cvss_score": None, "cvss_version": None, "cvss_source": None, "epss": None, "kev": NOT_LISTED, "id_may_not_exist": True},
+        {"cvss_score": None, "cvss_version": None, "cvss_source": None, "epss": 0.1, "kev": NOT_LISTED, "osv_record": False, "id_may_not_exist": True},
+        {"cvss_score": None, "cvss_version": None, "cvss_source": None, "epss": None, "kev": LISTED, "osv_record": False, "id_may_not_exist": True},
+        {"cvss_score": None, "cvss_version": None, "cvss_source": None, "epss": None, "kev": UNKNOWN, "osv_record": False, "id_may_not_exist": True},
+    ],
+    ids=["cvss-without-osv-record", "may-not-exist-but-osv-record", "may-not-exist-but-epss", "may-not-exist-but-kev-listed", "may-not-exist-but-kev-unknown"],
+)
+def test_inconsistent_osv_flags_rejected(kwargs):
+    with pytest.raises(ValueError):
+        score_vulnerability(**kwargs)
+
+
+def test_kev_unknown_reasoning_names_the_cause():
+    default = score_vulnerability(cvss_score=5.0, cvss_version="3.1", cvss_source="vector", epss=0.1, kev=UNKNOWN)
+    no_alias = score_vulnerability(
+        cvss_score=5.0, cvss_version="3.1", cvss_source="vector", epss=0.1, kev=KEVInput.unknown("no CVE alias to look up")
+    )
+
+    assert "KEV status could not be determined (catalog unavailable)" in default.reasoning
+    assert "KEV status could not be determined (no CVE alias to look up)" in no_alias.reasoning
+    assert "catalog unavailable" not in no_alias.reasoning
+
+
+# --- unknown bucket: no CVSS or low confidence, and not KEV-listed ---
+
+UNKNOWN_EXPLAINED = "too little data to classify"
+NOT_A_VERDICT = "This is not a low-risk verdict"
+
+
+def test_no_cvss_tiny_epss_not_listed_is_unknown():
+    result = score(cvss=None, epss=0.002, kev=NOT_LISTED)
+
+    assert result.bucket is Bucket.UNKNOWN
+    assert result.confidence is Confidence.PARTIAL  # EPSS and KEV answered
+    assert result.score == 0  # the number is still returned
+    assert "Bucket is unknown: too little data to classify (missing CVSS severity)" in result.reasoning
+    assert NOT_A_VERDICT in result.reasoning
+
+
+@pytest.mark.parametrize("kev", [LISTED, LISTED_STALE], ids=["fresh", "stale"])
+@pytest.mark.parametrize("epss", [None, 0.0, 0.002])
+def test_no_cvss_kev_listed_is_critical(kev, epss):
+    result = score(cvss=None, epss=epss, kev=kev)
+
+    assert (result.score, result.bucket) == (80, Bucket.CRITICAL)
+    assert UNKNOWN_EXPLAINED not in result.reasoning
+
+
+def test_cvss_present_epss_missing_not_listed_low_cvss_is_computed():
+    # The earlier "partial confidence + low score -> low" case, kept for CVSS present.
+    result = score(cvss=3.1, epss=None, kev=NOT_LISTED)
+
+    assert (result.score, result.bucket, result.confidence) == (12, Bucket.LOW, Confidence.PARTIAL)
+    assert UNKNOWN_EXPLAINED not in result.reasoning
+
+
+@pytest.mark.parametrize(
+    ("cvss", "epss", "kev", "gaps"),
+    [
+        (7.5, None, UNKNOWN, "EPSS, KEV status"),  # CVSS present: rule (a) alone
+        (None, 0.4, UNKNOWN, "CVSS severity, KEV status"),
+        (None, None, NOT_LISTED, "CVSS severity, EPSS"),
+        (None, None, UNKNOWN, "CVSS severity, EPSS, KEV status"),
+    ],
+)
+def test_low_confidence_not_listed_is_unknown(cvss, epss, kev, gaps):
+    result = score(cvss=cvss, epss=epss, kev=kev)
+
+    assert result.confidence is Confidence.LOW
+    assert result.bucket is Bucket.UNKNOWN
+    assert f"too little data to classify (missing {gaps})" in result.reasoning
+    assert NOT_A_VERDICT in result.reasoning
+
+
+@pytest.mark.parametrize("kev", [NOT_LISTED, NOT_LISTED_STALE], ids=["fresh", "stale"])
+def test_full_confidence_unaffected(kev):
+    for cvss, epss in itertools.product(CVSS_GRID, EPSS_GRID):
+        result = score(cvss=cvss, epss=epss, kev=kev)
+        assert result.confidence is Confidence.FULL
+        assert result.bucket is not Bucket.UNKNOWN, (cvss, epss)
+        assert UNKNOWN_EXPLAINED not in result.reasoning
+
+
+def test_stale_not_listed_still_counts_as_not_listed():
+    stale = score(cvss=None, epss=0.002, kev=NOT_LISTED_STALE)
+    fresh = score(cvss=None, epss=0.002, kev=NOT_LISTED)
+
+    assert stale.bucket is fresh.bucket is Bucket.UNKNOWN
+    assert stale.score == fresh.score
+    assert f"KEV data is stale (catalog fetched at {FETCHED}" in stale.reasoning
+    assert "stale" not in fresh.reasoning
+
+
+@pytest.mark.parametrize(("cvss", "epss"), list(itertools.product([None, 0.0, 5.0, 10.0], [None, 0.0, 0.5])))
+@pytest.mark.parametrize("kev", ALL_KEV, ids=lambda k: f"{k.status}-stale{k.stale}")
+def test_unknown_iff_not_listed_and_low_confidence_or_no_cvss(cvss, epss, kev):
+    result = score(cvss=cvss, epss=epss, kev=kev)
+    expected_unknown = kev.status is not KEVStatus.LISTED and (result.confidence is Confidence.LOW or cvss is None)
+
+    assert (result.bucket is Bucket.UNKNOWN) is expected_unknown
+    assert (UNKNOWN_EXPLAINED in result.reasoning) is expected_unknown
+    if kev.status is KEVStatus.LISTED:
+        assert result.bucket is Bucket.CRITICAL

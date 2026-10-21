@@ -120,11 +120,141 @@ async def test_both_enrichment_sources_fail(deps):
 
 
 @respx.mock
-async def test_osv_failure_fails_whole_call(deps):
-    mock_all(osv={"return_value": httpx.Response(404)})
+@pytest.mark.parametrize(
+    ("osv_mock", "message"),
+    [
+        ({"return_value": httpx.Response(503)}, r"OSV.dev is unavailable \(HTTP 503\)"),
+        ({"return_value": httpx.Response(500)}, r"OSV.dev is unavailable \(HTTP 500\)"),
+        ({"return_value": httpx.Response(429)}, "OSV.dev is rate limiting"),
+        ({"return_value": httpx.Response(400)}, r"OSV.dev rejected the request \(HTTP 400\)"),
+        ({"side_effect": httpx.ReadTimeout("slow")}, "OSV.dev timed out"),
+        ({"side_effect": httpx.ConnectError("refused")}, "OSV.dev is unreachable"),
+    ],
+    ids=["503", "500", "429", "400", "timeout", "unreachable"],
+)
+async def test_osv_failure_fails_whole_call(deps, osv_mock, message):
+    # Any OSV failure other than a 404 for a CVE still fails the call (see the
+    # no-OSV-record tests below for the 404 case).
+    mock_all(osv=osv_mock)
 
-    with pytest.raises(ToolError, match=f"No OSV.dev advisory found for {CVE}"):
+    with pytest.raises(ToolError, match=message):
         await triage(CVE, **deps)
+
+
+# --- CVE with no OSV.dev record (404) ---
+
+NO_RECORD = {"source": "osv", "reason": "no OSV.dev record (common for vendor/closed-source products)"}
+NO_SEVERITY = "The score has no severity component, so the bucket reflects exploitation signals (EPSS, KEV) only."
+
+
+@respx.mock
+async def test_ghsa_without_osv_record_still_raises(deps):
+    respx.get(OSV_GHSA_URL).mock(return_value=httpx.Response(404))
+    _, epss_route, kev_route = mock_all()
+
+    with pytest.raises(ToolError, match=f"No OSV.dev advisory found for {GHSA}"):
+        await triage(GHSA, **deps)
+    assert epss_route.call_count == 0 and kev_route.call_count == 0
+
+
+@respx.mock
+async def test_malformed_cve_like_id_404_still_raises(deps):
+    # triage expects validated IDs; if one slips through, a 404 must not become "no record".
+    bad = "CVE-21-1"
+    respx.get(f"{osv_client.BASE_URL}/vulns/{bad}").mock(return_value=httpx.Response(404))
+    respx.get(epss_client.BASE_URL).mock(return_value=httpx.Response(200, json={"data": []}))
+    respx.get(kev_client.FEED_URL).mock(return_value=httpx.Response(200, json=KEV_BODY))
+
+    with pytest.raises(ToolError, match=f"No OSV.dev advisory found for {bad}"):
+        await triage(bad, **deps)
+
+
+@respx.mock
+async def test_cve_without_osv_record_kev_listed_floors_at_80(deps):
+    mock_all(osv={"return_value": httpx.Response(404)})  # KEV lists CVE, EPSS 0.94424
+
+    result = await triage(CVE, **deps)
+
+    assert result["advisory"] is None
+    assert result["fix_available"] is None
+    assert result["missing_sources"] == [NO_RECORD]
+    assert result["partial"] is True
+    priority = result["priority"]
+    assert priority["components"] == {"epss": 33.0, "kev": 25.0}  # no "cvss" key
+    assert (priority["score"], priority["bucket"], priority["confidence"]) == (80, "critical", "partial")
+    assert "No OSV.dev record (common for vendor/closed-source products), so there is no CVSS score." in priority["reasoning"]
+    assert NO_SEVERITY in priority["reasoning"]
+    assert "Score raised from 58 to the KEV floor of 80. CISA KEV lists it as exploited in the wild" in priority["reasoning"]
+    assert "may not exist" not in priority["reasoning"]
+
+
+@respx.mock
+async def test_cve_without_osv_record_not_in_kev_tiny_epss_is_unknown(deps):
+    # Re-ruled: no CVSS + not KEV-listed -> unknown (was "low, partial"). Confidence is
+    # still partial (EPSS and KEV answered); the bucket is what changes.
+    other = "CVE-2024-12345"
+    respx.get(f"{osv_client.BASE_URL}/vulns/{other}").mock(return_value=httpx.Response(404))
+    respx.get(epss_client.BASE_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"cve": other, "epss": "0.00210", "percentile": "0.41000"}]})
+    )
+    respx.get(kev_client.FEED_URL).mock(return_value=httpx.Response(200, json=KEV_BODY))  # lists only Log4Shell
+
+    result = await triage(other, **deps)
+
+    assert result["missing_sources"] == [NO_RECORD]
+    assert result["kev"]["status"] is KEVStatus.NOT_LISTED
+    priority = result["priority"]
+    assert priority["components"] == {"epss": 0.1, "kev": 0.0}
+    assert (priority["score"], priority["bucket"], priority["confidence"]) == (0, "unknown", "partial")
+    assert "Bucket is unknown: too little data to classify (missing CVSS severity)" in priority["reasoning"]
+    assert "This is not a low-risk verdict" in priority["reasoning"]
+    assert "No OSV.dev record (common for vendor/closed-source products)" in priority["reasoning"]
+    assert NO_SEVERITY in priority["reasoning"]
+    assert "Confidence partial: 2 of 3 signals; missing CVSS." in priority["reasoning"]
+    assert "may not exist" not in priority["reasoning"]  # EPSS knows it
+
+
+@respx.mock
+async def test_cve_unknown_everywhere_may_not_exist(deps):
+    # Well-formed, so validation accepts it, but no source knows it. (A typo that lands on
+    # another real CVE, e.g. CVE-2021-4422, can't be detected; it gets that CVE's result.)
+    typo = "CVE-2099-0000001"
+    respx.get(f"{osv_client.BASE_URL}/vulns/{typo}").mock(return_value=httpx.Response(404))
+    respx.get(epss_client.BASE_URL).mock(return_value=httpx.Response(200, json={"data": []}))
+    respx.get(kev_client.FEED_URL).mock(return_value=httpx.Response(200, json=KEV_BODY))
+
+    result = await triage(typo, **deps)
+
+    priority = result["priority"]
+    assert result["missing_sources"] == [NO_RECORD]  # EPSS answered (no score); not a failure
+    assert result["epss"] is None
+    # Re-ruled: low confidence + not KEV-listed -> unknown (was "low").
+    assert (priority["score"], priority["bucket"], priority["confidence"]) == (0, "unknown", "low")
+    assert "too little data to classify (missing CVSS severity, EPSS)" in priority["reasoning"]
+    assert priority["components"] == {"kev": 0.0}
+    assert "This ID may not exist or may be too new" in priority["reasoning"]
+    assert "Check the ID for typos." in priority["reasoning"]
+    assert NO_SEVERITY in priority["reasoning"]
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("epss_mock", "kev_mock", "missing"),
+    [
+        ({"return_value": httpx.Response(503)}, {"return_value": httpx.Response(200, json={"vulnerabilities": []})}, ["osv", "FIRST EPSS"]),
+        ({"return_value": httpx.Response(200, json={"data": []})}, {"return_value": httpx.Response(503)}, ["osv", "CISA KEV"]),
+    ],
+    ids=["epss-failed", "kev-failed"],
+)
+async def test_cve_without_osv_record_and_a_failed_source_never_says_may_not_exist(deps, epss_mock, kev_mock, missing):
+    # A source that failed proves nothing about whether the ID exists.
+    mock_all(osv={"return_value": httpx.Response(404)}, epss=epss_mock, kev=kev_mock)
+
+    result = await triage(CVE, **deps)
+
+    assert [m["source"] for m in result["missing_sources"]] == missing
+    assert result["priority"]["confidence"] == "low"
+    assert "may not exist" not in result["priority"]["reasoning"]
 
 
 @respx.mock

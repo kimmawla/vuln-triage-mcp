@@ -5,6 +5,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 import httpx
+import jsonschema
 import pytest
 import respx
 from fastmcp import Client
@@ -349,3 +350,27 @@ async def test_tools_write_nothing_to_stdout(capsys):
         await call("lookup_vulnerability", vuln_id="bad")
 
     assert capsys.readouterr().out == ""
+
+
+# --- Output schema advertises the bucket values, including unknown ---
+
+
+@respx.mock
+async def test_triage_output_schema_validates_unknown_bucket():
+    ghsa_only = {**DJANGO, "aliases": ["PYSEC-2026-48"]}  # no CVE alias -> low confidence -> unknown
+    respx.get(OSV_VULN_URL).mock(return_value=httpx.Response(200, json=ghsa_only))
+
+    async with Client(mcp) as client:
+        tool = {t.name: t for t in await client.list_tools()}["triage_vulnerability"]
+        result = (await client.call_tool("triage_vulnerability", {"vuln_id": GHSA})).structured_content
+
+    schema = tool.output_schema
+    bucket_schema = schema["properties"]["priority"]["properties"]["bucket"]
+    assert bucket_schema["enum"] == ["critical", "high", "medium", "low", "unknown"]
+
+    assert result["priority"]["bucket"] == "unknown"
+    jsonschema.validate(result, schema)  # the real result validates
+
+    bogus = {**result, "priority": {**result["priority"], "bucket": "safe"}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bogus, schema)
