@@ -3,6 +3,8 @@ name = "vuln-triage-mcp"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "cvss>=3.6,<3.7",

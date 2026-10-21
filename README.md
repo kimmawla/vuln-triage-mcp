@@ -75,4 +75,4 @@ OSV.dev, FIRST EPSS (cite per their usage terms), CISA KEV. Not affiliated with 
 `uv sync`, `uv run pytest`, running the Inspector, live-test marker.
 
 ## License
-Apache-2.0
+MIT
