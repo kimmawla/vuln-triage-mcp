@@ -14,7 +14,7 @@ from vuln_triage_mcp.clients import epss as epss_client
 from vuln_triage_mcp.clients import kev as kev_client
 from vuln_triage_mcp.clients import osv as osv_client
 from vuln_triage_mcp.clients.osv import MAX_QUERY_RESULTS
-from vuln_triage_mcp.server import mcp
+from vuln_triage_mcp.server import UNKNOWN_VERSION, mcp, package_version
 
 FIXTURES = Path(__file__).parent / "fixtures" / "osv"
 # Real advisory GHSA-5mf9-h53q-7mhq (Django), CVSS 3.1 6.5, alias CVE-2026-33033.
@@ -91,6 +91,14 @@ async def test_server_reports_package_version(mode):
 
     assert server_info.name == "vuln-triage"
     assert server_info.version == expected
+    assert server_info.version != version("fastmcp")
+    assert server_info.version != UNKNOWN_VERSION  # the package is installed in the test env
+
+
+def test_package_version_falls_back_when_not_installed():
+    # A real PackageNotFoundError from importlib.metadata, no patching involved.
+    assert package_version("vuln-triage-mcp-not-installed-xyz") == UNKNOWN_VERSION == "0.0.0+unknown"
+    assert package_version() == version("vuln-triage-mcp")
 
 
 # --- lookup_vulnerability ---

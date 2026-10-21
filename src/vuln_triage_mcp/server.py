@@ -3,7 +3,7 @@
 import logging
 import sys
 from collections.abc import AsyncIterator
-from importlib.metadata import version
+from importlib import metadata
 from typing import Any
 
 from fastmcp import Context, FastMCP
@@ -21,6 +21,19 @@ from vuln_triage_mcp.validation import (
 
 _READ_ONLY = {"readOnlyHint": True, "openWorldHint": True}
 
+PACKAGE_NAME = "vuln-triage-mcp"
+UNKNOWN_VERSION = "0.0.0+unknown"
+
+
+def package_version(distribution: str = PACKAGE_NAME) -> str:
+    """The installed version of `distribution` (default: this package), or UNKNOWN_VERSION
+    when it is not installed (e.g. imported from a source tree on sys.path), so import
+    never fails over it."""
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return UNKNOWN_VERSION
+
 
 @lifespan
 async def clients(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
@@ -32,7 +45,7 @@ async def clients(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 mcp = FastMCP(
     "vuln-triage",
     # Report this package's version (single source of truth: pyproject.toml), not FastMCP's.
-    version=version("vuln-triage-mcp"),
+    version=package_version(),
     instructions=(
         "Vulnerability triage using OSV.dev, FIRST EPSS, and CISA KEV. "
         "For any 'how urgent is this / what should I fix first' question, use "
