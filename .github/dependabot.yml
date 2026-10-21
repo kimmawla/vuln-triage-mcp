@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions in .github/workflows current; Dependabot updates the
+  # SHA and its "# vX.Y.Z" comment together. (The mcp-publisher binary in release.yml is
+  # not an action, so bump its version and checksum by hand.)
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait a week after a release before proposing it, so a compromised or broken
+    # release has time to be caught upstream.
+    cooldown:
+      default-days: 7
