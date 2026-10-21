@@ -53,6 +53,11 @@ _VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~:!-]*")
 _MAX_VERSION_LEN = 128
 
 
+def is_cve_id(value: object) -> bool:
+    """True only for an exact canonical CVE ID (CVE-YYYY-NNNN, 4-7 digits, ASCII)."""
+    return isinstance(value, str) and value.isascii() and _CVE_RE.fullmatch(value) is not None
+
+
 def validate_cve_id(cve_id: object) -> str:
     """Return the canonical form of a CVE ID, or raise ToolError (with a hint for GHSA IDs)."""
     if isinstance(cve_id, str) and len(cve_id) <= _MAX_ID_LEN:
